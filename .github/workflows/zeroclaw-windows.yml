@@ -5,8 +5,14 @@ name: zeroclaw-windows
 # 产出与官方发布的 zeroclaw-x86_64-pc-windows-msvc.zip 对齐：
 #   - artifact 名 = zeroclaw-x86_64-pc-windows-msvc → 下载下来就是同名 .zip
 #   - 目录结构 = 根目录放 exe，web/dist 作为子目录（和官方 7z 打包一致）
-#   - 可选：一起编 zerocode.exe / zerorelay.exe（官方的 zip 里有）
-#   - 可选：用 Node 构建 web 面板并打进 web/dist（官方 zip 里有；关掉就不含面板）
+#   - 一起编 zerocode.exe / zerorelay.exe（官方的 zip 里有）
+#   - 用 Node 构建 web 面板并打进 web/dist（官方的 zip 里有；浏览器 Web UI 需要它）
+#
+# 已锁定的两项（不需要在 Run workflow 时再选）：
+#   opt-level = "s"  —— 官方发布用 "z"（纯体积优先），"s" 保留部分速度优化，
+#                        体积介于 z 与 2 之间；刻意不追顶格 3，避免白增体积。
+#   web 面板一定构建并打包 —— gateway 从磁盘读 web/dist（rust-embed 已移除），
+#                        面板不是编进 exe 的，所以必须随包分发。
 #
 # 仓库自带 .cargo/config.toml 已为 x86_64-pc-windows-msvc 配了
 #   rustflags = ["-C","target-feature=+crt-static","-C","link-arg=/STACK:8388608"]
@@ -23,13 +29,6 @@ on:
           - dist
           - dist-broad
         default: 'dist'
-      opt_level:
-        description: '优化取向：3=最快运行 / z=最小体积（官方发布用的是 z）'
-        type: choice
-        options:
-          - '3'
-          - 'z'
-        default: '3'
       target_cpu:
         description: '追加的 -C target-cpu（Xeon W-2255=Cascade Lake → cascadelake；留空则不追加）'
         type: string
@@ -42,13 +41,6 @@ on:
           - 'true'
           - 'false'
         default: 'true'
-      build_web:
-        description: '是否用 Node 构建 web 面板并打进 web/dist（官方 zip 里有；需要多花几分钟）'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
-        default: 'false'
   push:
     branches: [master, main]
     paths-ignore:
@@ -60,13 +52,14 @@ jobs:
   build:
     name: Build zeroclaw.exe (${{ inputs.distribution || 'dist' }})
     runs-on: windows-latest
-    timeout-minutes: 150
+    timeout-minutes: 180
     env:
       CI: "true"
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
       # 覆盖 [profile.release]（上游是 opt-level="z" + fat LTO + cgu=1 + strip + panic=abort）
-      CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ inputs.opt_level || '3' }}
+      # 锁定为 "s"：体积优先但保留部分速度优化。
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "s"
       CARGO_PROFILE_RELEASE_LTO: "fat"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
       CARGO_PROFILE_RELEASE_PANIC: "abort"
@@ -81,7 +74,6 @@ jobs:
           # docs/book/po 是翻译子模块，构建不需要，保持默认（不拉取）
 
       - name: Setup Node (for web dashboard)
-        if: ${{ (inputs.build_web || 'false') == 'true' }}
         uses: actions/setup-node@v4
         with:
           node-version-file: '.nvmrc'
@@ -106,21 +98,20 @@ jobs:
           rustup show active-toolchain
 
       - name: Patch Cargo.toml opt-level
-        # 上游改掉 opt-level = "z" 时只告警不中断，避免"上游无害改动 → 构建误失败"
+        # 上游 [profile.release] 是 opt-level = "z"，这里固定改成 "s"
+        #（TOML 里数值档 2/3 不带引号，但 s/z 必须带引号）。
+        # 上游若改掉 "z"，只告警不中断，避免"上游无害改动 → 构建误失败"。
         shell: pwsh
-        env:
-          OPT: ${{ inputs.opt_level || '3' }}
         run: |
           $ErrorActionPreference = "Stop"
           $path = "Cargo.toml"
           $text = [System.IO.File]::ReadAllText((Resolve-Path $path))
-          if ("$env:OPT" -eq "z") { Write-Host "保持上游 opt-level = `"z`"（体积优先）"; exit 0 }
           if ($text -notmatch 'opt-level\s*=\s*"z"') {
             Write-Warning "Cargo.toml 里没有 opt-level = `"z`"，跳过本步、构建继续。当前值："
             Select-String -Path $path -Pattern 'opt-level' | ForEach-Object { $_.Line.Trim() }
             exit 0
           }
-          $text = $text -replace 'opt-level\s*=\s*"z"', ('opt-level = ' + $env:OPT)
+          $text = $text -replace 'opt-level\s*=\s*"z"', 'opt-level = "s"'
           [System.IO.File]::WriteAllText((Resolve-Path $path), $text, (New-Object System.Text.UTF8Encoding($false)))
           Select-String -Path $path -Pattern '^opt-level' | ForEach-Object { $_.Line.Trim() }
 
@@ -148,14 +139,16 @@ jobs:
           Select-String -Path $path -Pattern 'target-cpu' | ForEach-Object { $_.Line.Trim() }
 
       - name: Build web dashboard
-        if: ${{ (inputs.build_web || 'false') == 'true' }}
+        # 锁定：每次都构建面板。xtask 包装：渲染 gateway 的 OpenAPI 3.1 →
+        # npx openapi-typescript 生成前端类型 → npm ci → vite build。
         shell: pwsh
-        timeout-minutes: 25
+        timeout-minutes: 30
         run: |
           $ErrorActionPreference = "Stop"
-          # xtask 包装：渲染 OpenAPI → npx openapi-typescript → npm ci → vite build
           cargo web build
           if (-not (Test-Path "web/dist/index.html")) { throw "web/dist/index.html 没生成，面板构建失败" }
+          $bytes = (Get-ChildItem -Recurse web/dist | Measure-Object -Property Length -Sum).Sum
+          Write-Host ("web/dist 大小: {0:N2} MiB" -f ($bytes / 1MB))
 
       - name: Resolve feature set (xtask)
         shell: pwsh
@@ -194,7 +187,6 @@ jobs:
         shell: pwsh
         env:
           COMPANIONS: ${{ inputs.companions || 'true' }}
-          BUILD_WEB: ${{ inputs.build_web || 'false' }}
         run: |
           $ErrorActionPreference = "Stop"
           $rel = "target/x86_64-pc-windows-msvc/release"
@@ -202,22 +194,16 @@ jobs:
           New-Item -ItemType Directory -Path staging | Out-Null
 
           Copy-Item "$rel/zeroclaw.exe" staging/
-          $extras = @()
           if ("$env:COMPANIONS" -ne "false") {
             foreach ($b in @("zerocode.exe", "zerorelay.exe")) {
-              if (Test-Path "$rel/$b") { Copy-Item "$rel/$b" staging/; $extras += $b }
+              if (Test-Path "$rel/$b") { Copy-Item "$rel/$b" staging/ }
             }
           }
-          if ("$env:BUILD_WEB" -eq "true") {
-            New-Item -ItemType Directory -Path staging/web | Out-Null
-            Copy-Item -Recurse -Force web/dist staging/web/dist
-            Write-Host "web/dist 已打包"
-          } else {
-            Write-Host "未打包 web 面板（build_web=false）。运行时 gateway 会去 exe 同级的 web/dist 找面板："
-            Write-Host "  · 或把官方 zip 里的 web/ 目录放在 exe 旁边，"
-            Write-Host "  · 或从 Cross-Platform Build 那次运行下载 web-dist artifact 解压成 <exe目录>\\web\\dist，"
-            Write-Host "  · 或用 gateway.web_dist_dir 指定路径。"
-          }
+
+          # 面板一定打包：gateway 从 exe 同级的 web/dist 读取（不是编进 exe 的）
+          New-Item -ItemType Directory -Path staging/web | Out-Null
+          Copy-Item -Recurse -Force web/dist staging/web/dist
+          if (-not (Test-Path "staging/web/dist/index.html")) { throw "staging/web/dist/index.html 缺失" }
 
           Get-ChildItem -Recurse staging | ForEach-Object {
             "{0,10:N0}  {1}" -f $_.Length, $_.FullName.Replace((Get-Location).Path + '\', '')
@@ -246,7 +232,11 @@ jobs:
           $exe = "staging/zeroclaw.exe"
           & $exe --version
           Write-Host "exit code = $LASTEXITCODE"
-          Write-Host ("size: {0:N2} MiB" -f ((Get-Item $exe).Length / 1MB))
+          Write-Host ("zeroclaw.exe size: {0:N2} MiB" -f ((Get-Item $exe).Length / 1MB))
+          if (Test-Path "staging/web/dist/index.html") {
+            $web = (Get-ChildItem -Recurse staging/web | Measure-Object -Property Length -Sum).Sum
+            Write-Host ("web/ size: {0:N2} MiB" -f ($web / 1MB))
+          }
           Get-FileHash $exe -Algorithm SHA256 | Format-List
 
       - name: Upload zeroclaw-x86_64-pc-windows-msvc
