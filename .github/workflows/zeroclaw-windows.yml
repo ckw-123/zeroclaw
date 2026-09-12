@@ -1,0 +1,259 @@
+name: zeroclaw-windows
+
+# 只编 Windows x64（x86_64-pc-windows-msvc），产物走 Actions Artifacts，不发 Release。
+#
+# 产出与官方发布的 zeroclaw-x86_64-pc-windows-msvc.zip 对齐：
+#   - artifact 名 = zeroclaw-x86_64-pc-windows-msvc → 下载下来就是同名 .zip
+#   - 目录结构 = 根目录放 exe，web/dist 作为子目录（和官方 7z 打包一致）
+#   - 可选：一起编 zerocode.exe / zerorelay.exe（官方的 zip 里有）
+#   - 可选：用 Node 构建 web 面板并打进 web/dist（官方 zip 里有；关掉就不含面板）
+#
+# 仓库自带 .cargo/config.toml 已为 x86_64-pc-windows-msvc 配了
+#   rustflags = ["-C","target-feature=+crt-static","-C","link-arg=/STACK:8388608"]
+# 所以 exe 默认就不依赖 vcruntime140.dll / msvcp140.dll；本工作流只往数组前面追加 target-cpu
+# （刻意不用 RUSTFLAGS 环境变量：它会整体取代 config.toml 里的 rustflags，把那两条弄丢）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      distribution:
+        description: '功能档：dist（官方标准发布档）/ dist-broad（更全，编得久）'
+        type: choice
+        options:
+          - dist
+          - dist-broad
+        default: 'dist'
+      opt_level:
+        description: '优化取向：3=最快运行 / z=最小体积（官方发布用的是 z）'
+        type: choice
+        options:
+          - '3'
+          - 'z'
+        default: '3'
+      target_cpu:
+        description: '追加的 -C target-cpu（Xeon W-2255=Cascade Lake → cascadelake；留空则不追加）'
+        type: string
+        required: false
+        default: 'cascadelake'
+      companions:
+        description: '是否一起编 zerocode.exe / zerorelay.exe（官方 zip 里有）'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+        default: 'true'
+      build_web:
+        description: '是否用 Node 构建 web 面板并打进 web/dist（官方 zip 里有；需要多花几分钟）'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+        default: 'false'
+  push:
+    branches: [master, main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'web/**'
+
+jobs:
+  build:
+    name: Build zeroclaw.exe (${{ inputs.distribution || 'dist' }})
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      CI: "true"
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      # 覆盖 [profile.release]（上游是 opt-level="z" + fat LTO + cgu=1 + strip + panic=abort）
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ inputs.opt_level || '3' }}
+      CARGO_PROFILE_RELEASE_LTO: "fat"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+      CARGO_PROFILE_RELEASE_PANIC: "abort"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_STRIP: "symbols"
+      CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # docs/book/po 是翻译子模块，构建不需要，保持默认（不拉取）
+
+      - name: Setup Node (for web dashboard)
+        if: ${{ (inputs.build_web || 'false') == 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install toolchain (upstream pins 1.98.0)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          prefix-key: zeroclaw-windows
+
+      - name: Show toolchain
+        run: |
+          rustc -Vv
+          rustup show active-toolchain
+
+      - name: Patch Cargo.toml opt-level
+        # 上游改掉 opt-level = "z" 时只告警不中断，避免"上游无害改动 → 构建误失败"
+        shell: pwsh
+        env:
+          OPT: ${{ inputs.opt_level || '3' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "Cargo.toml"
+          $text = [System.IO.File]::ReadAllText((Resolve-Path $path))
+          if ("$env:OPT" -eq "z") { Write-Host "保持上游 opt-level = `"z`"（体积优先）"; exit 0 }
+          if ($text -notmatch 'opt-level\s*=\s*"z"') {
+            Write-Warning "Cargo.toml 里没有 opt-level = `"z`"，跳过本步、构建继续。当前值："
+            Select-String -Path $path -Pattern 'opt-level' | ForEach-Object { $_.Line.Trim() }
+            exit 0
+          }
+          $text = $text -replace 'opt-level\s*=\s*"z"', ('opt-level = ' + $env:OPT)
+          [System.IO.File]::WriteAllText((Resolve-Path $path), $text, (New-Object System.Text.UTF8Encoding($false)))
+          Select-String -Path $path -Pattern '^opt-level' | ForEach-Object { $_.Line.Trim() }
+
+      - name: Patch .cargo/config.toml with target-cpu
+        shell: pwsh
+        env:
+          TC: ${{ inputs.target_cpu || '' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:TC)) { Write-Host "未指定 target-cpu，保持上游 rustflags"; exit 0 }
+          $path = ".cargo/config.toml"
+          $text = [System.IO.File]::ReadAllText((Resolve-Path $path))
+          $pattern = "(?m)^(\[target\.x86_64-pc-windows-msvc\]\r?\nrustflags = \[)"
+          if ($text -notmatch $pattern) {
+            Write-Warning "没找到 [target.x86_64-pc-windows-msvc] 的 rustflags（上游可能改过），跳过 target-cpu，构建继续"
+            $text2 = $text
+            if ($text2 -notmatch 'crt-static') {
+              Write-Warning "注意：该文件里也看不到 +crt-static，exe 可能会依赖 vcruntime140.dll（见后面 dumpbin 步骤）"
+            }
+            exit 0
+          }
+          $replacement = '$1"-C", "target-cpu=' + $env:TC + '", '
+          $text = $text -replace $pattern, $replacement
+          [System.IO.File]::WriteAllText((Resolve-Path $path), $text, (New-Object System.Text.UTF8Encoding($false)))
+          Select-String -Path $path -Pattern 'target-cpu' | ForEach-Object { $_.Line.Trim() }
+
+      - name: Build web dashboard
+        if: ${{ (inputs.build_web || 'false') == 'true' }}
+        shell: pwsh
+        timeout-minutes: 25
+        run: |
+          $ErrorActionPreference = "Stop"
+          # xtask 包装：渲染 OpenAPI → npx openapi-typescript → npm ci → vite build
+          cargo web build
+          if (-not (Test-Path "web/dist/index.html")) { throw "web/dist/index.html 没生成，面板构建失败" }
+
+      - name: Resolve feature set (xtask)
+        shell: pwsh
+        env:
+          DIST: ${{ inputs.distribution || 'dist' }}
+        run: |
+          $features = ""
+          try {
+            $features = (& cargo run --release -q -p xtask --bin generate -- features --selection "$env:DIST" --target x86_64-pc-windows-msvc 2>$null | Select-Object -Last 1)
+          } catch { }
+          $features = "$features".Trim()
+          if ([string]::IsNullOrWhiteSpace($features)) {
+            Write-Warning "xtask 解析 features 失败，回退到 default（功能会少于 dist 档）"
+            $features = "default"
+          }
+          Write-Host "resolved features: $features"
+          "FEATURES=$features" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build zeroclaw.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --locked -p zeroclaw `
+            --no-default-features --features "$env:FEATURES" `
+            --target x86_64-pc-windows-msvc
+
+      - name: Build zerocode.exe / zerorelay.exe
+        if: ${{ (inputs.companions || 'true') != 'false' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --locked -p zerocode  --target x86_64-pc-windows-msvc
+          cargo build --release --locked -p zerorelay --target x86_64-pc-windows-msvc
+
+      - name: Stage release archive (mirror official layout)
+        shell: pwsh
+        env:
+          COMPANIONS: ${{ inputs.companions || 'true' }}
+          BUILD_WEB: ${{ inputs.build_web || 'false' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $rel = "target/x86_64-pc-windows-msvc/release"
+          Remove-Item -Recurse -Force staging -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path staging | Out-Null
+
+          Copy-Item "$rel/zeroclaw.exe" staging/
+          $extras = @()
+          if ("$env:COMPANIONS" -ne "false") {
+            foreach ($b in @("zerocode.exe", "zerorelay.exe")) {
+              if (Test-Path "$rel/$b") { Copy-Item "$rel/$b" staging/; $extras += $b }
+            }
+          }
+          if ("$env:BUILD_WEB" -eq "true") {
+            New-Item -ItemType Directory -Path staging/web | Out-Null
+            Copy-Item -Recurse -Force web/dist staging/web/dist
+            Write-Host "web/dist 已打包"
+          } else {
+            Write-Host "未打包 web 面板（build_web=false）。运行时 gateway 会去 exe 同级的 web/dist 找面板："
+            Write-Host "  · 或把官方 zip 里的 web/ 目录放在 exe 旁边，"
+            Write-Host "  · 或从 Cross-Platform Build 那次运行下载 web-dist artifact 解压成 <exe目录>\\web\\dist，"
+            Write-Host "  · 或用 gateway.web_dist_dir 指定路径。"
+          }
+
+          Get-ChildItem -Recurse staging | ForEach-Object {
+            "{0,10:N0}  {1}" -f $_.Length, $_.FullName.Replace((Get-Location).Path + '\', '')
+          }
+
+      - name: Inspect PE imports (no vcruntime140 / msvcp140)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "staging/zeroclaw.exe"
+          $dumpbin = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $dumpbin) { Write-Host "找不到 dumpbin.exe，跳过依赖检查"; exit 0 }
+          $report = & $dumpbin.FullName /nologo /dependents $exe 2>&1 | Out-String
+          Write-Host $report
+          if ($report -match 'vcruntime140|msvcp140') {
+            throw "exe 依赖了 VC++ 运行库 DLL —— crt-static 丢失，检查 .cargo/config.toml 的 rustflags"
+          }
+          Write-Host "OK：只依赖 Windows 系统 DLL"
+
+      - name: Smoke test + size + SHA256
+        # 在 runner 的 CPU 上运行；若报 0xc000001d 说明该 runner 无 AVX-512，与本机无关
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = "staging/zeroclaw.exe"
+          & $exe --version
+          Write-Host "exit code = $LASTEXITCODE"
+          Write-Host ("size: {0:N2} MiB" -f ((Get-Item $exe).Length / 1MB))
+          Get-FileHash $exe -Algorithm SHA256 | Format-List
+
+      - name: Upload zeroclaw-x86_64-pc-windows-msvc
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-x86_64-pc-windows-msvc
+          path: staging/
+          if-no-files-found: error
+          retention-days: 30
